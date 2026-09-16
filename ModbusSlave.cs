@@ -13,7 +13,20 @@ public class ModbusSlave
     private readonly ILogger log;
     private readonly IPAddress ipAddress;
 
-    public ModbusSlave(int port, string? ipAddress, ILogger log)
+    private readonly ConcurrentDictionary<ushort, ushort>
+        holdingRegisterValues = new();
+
+    private const byte FcReadHoldingRegisters = 0x03;
+    private const byte FcReadInputRegisters = 0x04;
+
+    private const byte ExceptionIllegalFunction = 0x01;
+    private const byte ExceptionIllegalDataAddress = 0x02;
+    private const byte ExceptionIllegalDataValue = 0x03;
+
+    public ModbusSlave(
+        int port,
+        string? ipAddress,
+        ILogger log)
     {
         this.log = log;
         this.port = port;
@@ -23,99 +36,42 @@ public class ModbusSlave
             : IPAddress.Any;
     }
 
-    public async Task Run(CancellationToken cancel)
+    /// <summary>
+    /// Add a register that Fronius may probe during meter discovery.
+    /// </summary>
+    public void AddProbeRegister(ushort address, ushort value = 0)
     {
-        var ipEndPoint = new IPEndPoint(ipAddress, port);
-        TcpListener listener = new(ipEndPoint);
+        holdingRegisterValues[address] = value;
+    }
 
-        List<Task> clients = new();
-
-        listener.Start();
-
-        log.LogInformation(
-            "Modbus TCP listening on {Address}:{Port}",
-            ipAddress,
-            port);
-
-        var acceptTask = listener.AcceptTcpClientAsync(cancel);
-
-        try
+    /// <summary>
+    /// Fill a range with zeroes, without overwriting values already present.
+    /// </summary>
+    public void EnsureRegisterRange(ushort start, ushort end)
+    {
+        for (int address = start; address <= end; address++)
         {
-            while (!cancel.IsCancellationRequested)
-            {
-                var completedTask =
-                    await Task.WhenAny(
-                        clients.Concat(new[] { acceptTask.AsTask() }));
-
-                if (acceptTask.IsCompleted)
-                {
-                    var newClient = await acceptTask;
-
-                    log.LogInformation(
-                        "New Modbus client from {Remote}",
-                        newClient.Client.RemoteEndPoint);
-
-                    clients.Add(ClientTask(newClient, cancel));
-
-                    acceptTask = listener.AcceptTcpClientAsync(cancel);
-                }
-                else
-                {
-                    try
-                    {
-                        await completedTask;
-                    }
-                    catch (OperationCanceledException)
-                        when (cancel.IsCancellationRequested)
-                    {
-                        // Normal shutdown.
-                    }
-                    catch (Exception ex)
-                    {
-                        log.LogWarning(
-                            ex,
-                            "Modbus client task terminated with an error");
-                    }
-
-                    clients.Remove(completedTask);
-                }
-            }
-        }
-        finally
-        {
-            listener.Stop();
+            holdingRegisterValues.TryAdd((ushort)address, 0);
         }
     }
 
-    private const byte ModbusFcReadHoldingRegisters = 0x03;
-
-    private const byte ModbusExceptionIllegalFunction = 0x01;
-    private const byte ModbusExceptionIllegalDataAddress = 0x02;
-    private const byte ModbusExceptionIllegalDataValue = 0x03;
-
-    private const int ModbusMaxHoldingRegisters = 65536;
-
-    private readonly ConcurrentDictionary<ushort, ushort>
-        holdingRegisterValues = new();
-
-    public Task<ushort> SetHoldingRegister(ushort addr, ushort value)
+    public Task<ushort> SetHoldingRegister(
+        ushort addr,
+        ushort value)
     {
         holdingRegisterValues[addr] = value;
 
         return Task.FromResult((ushort)(addr + 1));
     }
 
-    public Task<ushort> SetHoldingRegister(ushort addr, float value)
+    public Task<ushort> SetHoldingRegister(
+        ushort addr,
+        float value)
     {
-        log.LogInformation(
-            "SetHoldingRegister {Address} = {Value}",
-            addr,
-            value);
-
         var bits = BitConverter.SingleToUInt32Bits(value);
 
         // SunSpec FLOAT32:
-        // high 16-bit word first, low 16-bit word second.
+        // high word first, low word second.
         holdingRegisterValues[addr] =
             (ushort)(bits >> 16);
 
@@ -140,52 +96,119 @@ public class ModbusSlave
                 .ToArray();
         }
 
-        var bytes = stringBytes
-            .Concat(
-                Enumerable.Range(
-                        0,
-                        maxBytes - stringBytes.Length)
-                    .Select(_ => (byte)0))
-            .ToArray();
+        var bytes = new byte[maxBytes];
+
+        Array.Copy(
+            stringBytes,
+            bytes,
+            stringBytes.Length);
 
         for (int i = 0; i < words; i++)
         {
             holdingRegisterValues[(ushort)(addr + i)] =
                 BinaryPrimitives.ReadUInt16BigEndian(
-                    bytes.AsSpan(i * 2));
+                    bytes.AsSpan(i * 2, 2));
         }
 
         return Task.FromResult((ushort)(addr + words));
+    }
+
+    public async Task Run(CancellationToken cancel)
+    {
+        var ipEndPoint =
+            new IPEndPoint(ipAddress, port);
+
+        var listener =
+            new TcpListener(ipEndPoint);
+
+        var clients =
+            new List<Task>();
+
+        listener.Start();
+
+        log.LogInformation(
+            "Modbus TCP listening on {Address}:{Port}",
+            ipAddress,
+            port);
+
+        try
+        {
+            var acceptTask =
+                listener.AcceptTcpClientAsync(cancel);
+
+            while (!cancel.IsCancellationRequested)
+            {
+                var allTasks =
+                    clients
+                        .Concat(new[] { acceptTask.AsTask() })
+                        .ToArray();
+
+                var completedTask =
+                    await Task.WhenAny(allTasks);
+
+                if (acceptTask.IsCompleted)
+                {
+                    var newClient =
+                        await acceptTask;
+
+                    log.LogInformation(
+                        "New Modbus client from {Remote}",
+                        newClient.Client.RemoteEndPoint);
+
+                    clients.Add(
+                        ClientTask(
+                            newClient,
+                            cancel));
+
+                    acceptTask =
+                        listener.AcceptTcpClientAsync(cancel);
+                }
+                else
+                {
+                    try
+                    {
+                        await completedTask;
+                    }
+                    catch (OperationCanceledException)
+                        when (cancel.IsCancellationRequested)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning(
+                            ex,
+                            "Modbus client task terminated with an error");
+                    }
+
+                    clients.Remove(completedTask);
+                }
+            }
+        }
+        finally
+        {
+            listener.Stop();
+        }
     }
 
     private async Task ClientTask(
         TcpClient client,
         CancellationToken cancel)
     {
-        var remote = client.Client.RemoteEndPoint?.ToString()
-                     ?? "unknown";
+        var remote =
+            client.Client.RemoteEndPoint?.ToString()
+            ?? "unknown";
 
         try
         {
             using (client)
             {
-                var stream = client.GetStream();
+                var stream =
+                    client.GetStream();
 
                 while (!cancel.IsCancellationRequested)
                 {
-                    /*
-                     * Modbus TCP MBAP header:
-                     *
-                     * bytes 0-1 : Transaction ID
-                     * bytes 2-3 : Protocol ID
-                     * bytes 4-5 : Length
-                     * byte  6   : Unit ID
-                     *
-                     * Length includes:
-                     *   Unit ID + PDU
-                     */
-
-                    var mbap = new byte[7];
+                    var mbap =
+                        new byte[7];
 
                     try
                     {
@@ -195,10 +218,6 @@ public class ModbusSlave
                     }
                     catch (EndOfStreamException)
                     {
-                        log.LogInformation(
-                            "Modbus client {Remote} disconnected",
-                            remote);
-
                         break;
                     }
 
@@ -214,82 +233,72 @@ public class ModbusSlave
                         BinaryPrimitives.ReadUInt16BigEndian(
                             mbap.AsSpan(4, 2));
 
-                    var unitId = mbap[6];
+                    var unitId =
+                        mbap[6];
 
                     if (protocolId != 0)
                     {
                         log.LogWarning(
-                            "Invalid Modbus protocol ID from {Remote}: " +
-                            "Transaction={Transaction}, " +
-                            "Protocol={Protocol}, Unit={Unit}",
+                            "Invalid Modbus protocol ID from {Remote}: {Protocol}",
                             remote,
-                            transactionId,
-                            protocolId,
-                            unitId);
+                            protocolId);
 
                         break;
                     }
 
-                    /*
-                     * Length includes the Unit ID byte which
-                     * we've already read as part of MBAP.
-                     */
                     if (length < 2)
                     {
                         log.LogWarning(
-                            "Invalid Modbus length from {Remote}: " +
-                            "Transaction={Transaction}, " +
-                            "Length={Length}, Unit={Unit}",
+                            "Invalid Modbus length from {Remote}: {Length}",
                             remote,
-                            transactionId,
-                            length,
-                            unitId);
+                            length);
 
                         break;
                     }
 
-                    var pduLength = length - 1;
-                    var pdu = new byte[pduLength];
+                    var pduLength =
+                        length - 1;
+
+                    var pdu =
+                        new byte[pduLength];
 
                     await stream.ReadExactlyAsync(
                         pdu,
                         cancel);
 
-                    var function = pdu[0];
+                    var function =
+                        pdu[0];
 
-                    /*
-                     * Log every request at Information level
-                     * while troubleshooting the Fronius.
-                     */
                     log.LogInformation(
-                        "MODBUS RX {Remote}: " +
-                        "TX={Transaction} Unit={Unit} " +
-                        "FC=0x{Function:X2} Length={Length} " +
-                        "PDU={Pdu}",
+                        "MODBUS RX {Remote}: TX={Transaction} Unit={Unit} " +
+                        "FC=0x{Function:X2} PDU={Pdu}",
                         remote,
                         transactionId,
                         unitId,
                         function,
-                        pduLength,
                         Convert.ToHexString(pdu));
 
                     switch (function)
                     {
-                        case ModbusFcReadHoldingRegisters:
-                            await HandleReadHoldingRegisters(
+                        case FcReadHoldingRegisters:
+                        case FcReadInputRegisters:
+
+                            await HandleReadRegisters(
                                 stream,
                                 remote,
                                 transactionId,
                                 unitId,
+                                function,
                                 pdu,
                                 cancel);
+
                             break;
 
                         default:
+
                             log.LogWarning(
                                 "Unsupported Modbus function from {Remote}: " +
-                                "TX={Transaction} Unit={Unit} " +
-                                "FC=0x{Function:X2}",
+                                "TX={Transaction} Unit={Unit} FC=0x{Function:X2}",
                                 remote,
                                 transactionId,
                                 unitId,
@@ -300,7 +309,7 @@ public class ModbusSlave
                                 transactionId,
                                 unitId,
                                 function,
-                                ModbusExceptionIllegalFunction,
+                                ExceptionIllegalFunction,
                                 cancel);
 
                             break;
@@ -311,7 +320,6 @@ public class ModbusSlave
         catch (OperationCanceledException)
             when (cancel.IsCancellationRequested)
         {
-            // Normal service shutdown.
         }
         catch (IOException ex)
         {
@@ -342,163 +350,130 @@ public class ModbusSlave
         }
     }
 
-    private async Task HandleReadHoldingRegisters(
+    private async Task HandleReadRegisters(
         NetworkStream stream,
         string remote,
         ushort transactionId,
         byte unitId,
+        byte function,
         byte[] pdu,
         CancellationToken cancel)
     {
-        /*
-         * FC03 request PDU:
-         *
-         * byte 0    : Function (03)
-         * bytes 1-2 : Starting address
-         * bytes 3-4 : Quantity
-         */
-
         if (pdu.Length != 5)
         {
-            log.LogWarning(
-                "Invalid FC03 request length from {Remote}: " +
-                "TX={Transaction} Unit={Unit} Length={Length}",
-                remote,
-                transactionId,
-                unitId,
-                pdu.Length);
-
             await SendExceptionResponse(
                 stream,
                 transactionId,
                 unitId,
-                ModbusFcReadHoldingRegisters,
-                ModbusExceptionIllegalDataValue,
+                function,
+                ExceptionIllegalDataValue,
                 cancel);
 
             return;
         }
 
-        var addr =
+        var address =
             BinaryPrimitives.ReadUInt16BigEndian(
                 pdu.AsSpan(1, 2));
 
-        var num =
+        var count =
             BinaryPrimitives.ReadUInt16BigEndian(
                 pdu.AsSpan(3, 2));
 
         log.LogInformation(
-            "FC03 {Remote}: TX={Transaction} Unit={Unit} " +
-            "Addr={Address} Count={Count} " +
-            "(end={EndAddress})",
+            "FC{Function:X2} {Remote}: TX={Transaction} Unit={Unit} " +
+            "Addr={Address} Count={Count} End={End}",
+            function,
             remote,
             transactionId,
             unitId,
-            addr,
-            num,
-            num > 0
-                ? (int)addr + num - 1
-                : addr);
+            address,
+            count,
+            count > 0
+                ? (int)address + count - 1
+                : address);
 
-        /*
-         * Modbus specifies a maximum of 125 registers
-         * in an FC03 request.
-         */
-        if (num == 0 || num > 125)
+        if (count == 0 || count > 125)
         {
-            log.LogWarning(
-                "Invalid FC03 register count from {Remote}: " +
-                "Addr={Address} Count={Count}",
-                remote,
-                addr,
-                num);
-
             await SendExceptionResponse(
                 stream,
                 transactionId,
                 unitId,
-                ModbusFcReadHoldingRegisters,
-                ModbusExceptionIllegalDataValue,
+                function,
+                ExceptionIllegalDataValue,
                 cancel);
 
             return;
         }
 
-        if ((int)addr + num > ModbusMaxHoldingRegisters)
+        if ((int)address + count > 65536)
         {
-            log.LogWarning(
-                "FC03 address range outside Modbus address space " +
-                "from {Remote}: Addr={Address} Count={Count}",
-                remote,
-                addr,
-                num);
-
             await SendExceptionResponse(
                 stream,
                 transactionId,
                 unitId,
-                ModbusFcReadHoldingRegisters,
-                ModbusExceptionIllegalDataAddress,
+                function,
+                ExceptionIllegalDataAddress,
                 cancel);
 
             return;
         }
 
         /*
-         * For now, retain the emulator's previous behavior:
+         * Match the reference emulator:
          *
-         * registers that haven't explicitly been populated
-         * are returned as zero.
-         *
-         * This is intentional while troubleshooting the
-         * Fronius because changing this to Illegal Data
-         * Address could alter meter-discovery behavior.
+         * every requested register must exist.
+         * Unknown addresses produce Modbus exception 02.
          */
+        for (int i = 0; i < count; i++)
+        {
+            var registerAddress =
+                (ushort)(address + i);
+
+            if (!holdingRegisterValues.ContainsKey(registerAddress))
+            {
+                log.LogWarning(
+                    "Unknown register requested by {Remote}: " +
+                    "Unit={Unit} FC=0x{Function:X2} Register={Register}",
+                    remote,
+                    unitId,
+                    function,
+                    registerAddress);
+
+                await SendExceptionResponse(
+                    stream,
+                    transactionId,
+                    unitId,
+                    function,
+                    ExceptionIllegalDataAddress,
+                    cancel);
+
+                return;
+            }
+        }
 
         var responsePdu =
-            new byte[2 + num * 2];
+            new byte[2 + count * 2];
 
         responsePdu[0] =
-            ModbusFcReadHoldingRegisters;
+            function;
 
         responsePdu[1] =
-            (byte)(num * 2);
+            (byte)(count * 2);
 
-        var missingRegisters =
-            new List<ushort>();
-
-        for (int i = 0; i < num; i++)
+        for (int i = 0; i < count; i++)
         {
-            var regaddr =
-                (ushort)(addr + i);
+            var registerAddress =
+                (ushort)(address + i);
 
-            ushort value;
-
-            if (!holdingRegisterValues.TryGetValue(
-                    regaddr,
-                    out value))
-            {
-                value = 0;
-                missingRegisters.Add(regaddr);
-            }
+            var value =
+                holdingRegisterValues[registerAddress];
 
             BinaryPrimitives.WriteUInt16BigEndian(
-                responsePdu.AsSpan(2 + i * 2, 2),
+                responsePdu.AsSpan(
+                    2 + i * 2,
+                    2),
                 value);
-        }
-
-        if (missingRegisters.Count > 0)
-        {
-            log.LogInformation(
-                "FC03 {Remote}: Unit={Unit} Addr={Address} " +
-                "Count={Count}: {MissingCount} registers " +
-                "were unset and returned as zero: {Missing}",
-                remote,
-                unitId,
-                addr,
-                num,
-                missingRegisters.Count,
-                FormatRegisterRanges(missingRegisters));
         }
 
         await SendResponse(
@@ -510,12 +485,13 @@ public class ModbusSlave
 
         log.LogInformation(
             "MODBUS TX {Remote}: TX={Transaction} Unit={Unit} " +
-            "FC=0x03 Addr={Address} Count={Count} OK",
+            "FC=0x{Function:X2} Addr={Address} Count={Count} OK",
             remote,
             transactionId,
             unitId,
-            addr,
-            num);
+            function,
+            address,
+            count);
     }
 
     private async Task SendExceptionResponse(
@@ -526,11 +502,12 @@ public class ModbusSlave
         byte exceptionCode,
         CancellationToken cancel)
     {
-        var responsePdu = new byte[]
-        {
-            (byte)(function | 0x80),
-            exceptionCode
-        };
+        var responsePdu =
+            new byte[]
+            {
+                (byte)(function | 0x80),
+                exceptionCode
+            };
 
         await SendResponse(
             stream,
@@ -540,7 +517,7 @@ public class ModbusSlave
             cancel);
 
         log.LogWarning(
-            "MODBUS TX exception: TX={Transaction} Unit={Unit} " +
+            "MODBUS TX EXCEPTION: TX={Transaction} Unit={Unit} " +
             "FC=0x{Function:X2} Exception=0x{Exception:X2}",
             transactionId,
             unitId,
@@ -555,10 +532,6 @@ public class ModbusSlave
         byte[] pdu,
         CancellationToken cancel)
     {
-        /*
-         * MBAP length =
-         *   Unit ID (1 byte) + PDU length
-         */
         var response =
             new byte[7 + pdu.Length];
 
@@ -566,7 +539,6 @@ public class ModbusSlave
             response.AsSpan(0, 2),
             transactionId);
 
-        // Modbus TCP protocol ID = 0
         BinaryPrimitives.WriteUInt16BigEndian(
             response.AsSpan(2, 2),
             0);
@@ -575,7 +547,8 @@ public class ModbusSlave
             response.AsSpan(4, 2),
             (ushort)(1 + pdu.Length));
 
-        response[6] = unitId;
+        response[6] =
+            unitId;
 
         pdu.CopyTo(
             response.AsSpan(7));
@@ -583,45 +556,5 @@ public class ModbusSlave
         await stream.WriteAsync(
             response,
             cancel);
-    }
-
-    private static string FormatRegisterRanges(
-        List<ushort> registers)
-    {
-        if (registers.Count == 0)
-        {
-            return "";
-        }
-
-        var ranges = new List<string>();
-
-        ushort start = registers[0];
-        ushort previous = registers[0];
-
-        for (int i = 1; i < registers.Count; i++)
-        {
-            var current = registers[i];
-
-            if (current == previous + 1)
-            {
-                previous = current;
-                continue;
-            }
-
-            ranges.Add(
-                start == previous
-                    ? start.ToString()
-                    : $"{start}-{previous}");
-
-            start = current;
-            previous = current;
-        }
-
-        ranges.Add(
-            start == previous
-                ? start.ToString()
-                : $"{start}-{previous}");
-
-        return string.Join(", ", ranges);
     }
 }
