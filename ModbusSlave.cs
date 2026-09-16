@@ -45,7 +45,7 @@ public class ModbusSlave
     }
 
     /// <summary>
-    /// Fill a range with zeroes, without overwriting values already present.
+    /// Fill a range with zeroes without overwriting values already present.
     /// </summary>
     public void EnsureRegisterRange(ushort start, ushort end)
     {
@@ -207,6 +207,14 @@ public class ModbusSlave
 
                 while (!cancel.IsCancellationRequested)
                 {
+                    /*
+                     * MBAP header:
+                     *
+                     * 0-1 Transaction ID
+                     * 2-3 Protocol ID
+                     * 4-5 Length
+                     * 6   Unit ID
+                     */
                     var mbap =
                         new byte[7];
 
@@ -239,8 +247,10 @@ public class ModbusSlave
                     if (protocolId != 0)
                     {
                         log.LogWarning(
-                            "Invalid Modbus protocol ID from {Remote}: {Protocol}",
+                            "Invalid Modbus protocol ID from {Remote}: " +
+                            "TID={TransactionId} Protocol={Protocol}",
                             remote,
+                            transactionId,
                             protocolId);
 
                         break;
@@ -249,13 +259,22 @@ public class ModbusSlave
                     if (length < 2)
                     {
                         log.LogWarning(
-                            "Invalid Modbus length from {Remote}: {Length}",
+                            "Invalid Modbus length from {Remote}: " +
+                            "TID={TransactionId} Length={Length}",
                             remote,
+                            transactionId,
                             length);
 
                         break;
                     }
 
+                    /*
+                     * MBAP Length contains:
+                     *
+                     * Unit ID (1 byte) + PDU
+                     *
+                     * Unit ID has already been read in mbap[6].
+                     */
                     var pduLength =
                         length - 1;
 
@@ -269,14 +288,30 @@ public class ModbusSlave
                     var function =
                         pdu[0];
 
+                    /*
+                     * Reconstruct the complete received ADU for
+                     * diagnostic logging.
+                     */
+                    var receivedAdu =
+                        new byte[mbap.Length + pdu.Length];
+
+                    mbap.CopyTo(
+                        receivedAdu,
+                        0);
+
+                    pdu.CopyTo(
+                        receivedAdu,
+                        mbap.Length);
+
                     log.LogInformation(
-                        "MODBUS RX {Remote}: TX={Transaction} Unit={Unit} " +
-                        "FC=0x{Function:X2} PDU={Pdu}",
+                        "MODBUS RX {Remote}: " +
+                        "TID={TransactionId} Unit={Unit} " +
+                        "FC=0x{Function:X2} ADU={Adu}",
                         remote,
                         transactionId,
                         unitId,
                         function,
-                        Convert.ToHexString(pdu));
+                        Convert.ToHexString(receivedAdu));
 
                     switch (function)
                     {
@@ -298,7 +333,8 @@ public class ModbusSlave
 
                             log.LogWarning(
                                 "Unsupported Modbus function from {Remote}: " +
-                                "TX={Transaction} Unit={Unit} FC=0x{Function:X2}",
+                                "TID={TransactionId} Unit={Unit} " +
+                                "FC=0x{Function:X2}",
                                 remote,
                                 transactionId,
                                 unitId,
@@ -306,6 +342,7 @@ public class ModbusSlave
 
                             await SendExceptionResponse(
                                 stream,
+                                remote,
                                 transactionId,
                                 unitId,
                                 function,
@@ -363,6 +400,7 @@ public class ModbusSlave
         {
             await SendExceptionResponse(
                 stream,
+                remote,
                 transactionId,
                 unitId,
                 function,
@@ -381,12 +419,14 @@ public class ModbusSlave
                 pdu.AsSpan(3, 2));
 
         log.LogInformation(
-            "FC{Function:X2} {Remote}: TX={Transaction} Unit={Unit} " +
-            "Addr={Address} Count={Count} End={End}",
-            function,
+            "MODBUS READ {Remote}: " +
+            "TID={TransactionId} Unit={Unit} " +
+            "FC=0x{Function:X2} Addr={Address} " +
+            "Count={Count} End={End}",
             remote,
             transactionId,
             unitId,
+            function,
             address,
             count,
             count > 0
@@ -397,6 +437,7 @@ public class ModbusSlave
         {
             await SendExceptionResponse(
                 stream,
+                remote,
                 transactionId,
                 unitId,
                 function,
@@ -410,6 +451,7 @@ public class ModbusSlave
         {
             await SendExceptionResponse(
                 stream,
+                remote,
                 transactionId,
                 unitId,
                 function,
@@ -420,9 +462,7 @@ public class ModbusSlave
         }
 
         /*
-         * Match the reference emulator:
-         *
-         * every requested register must exist.
+         * Every requested register must exist.
          * Unknown addresses produce Modbus exception 02.
          */
         for (int i = 0; i < count; i++)
@@ -434,14 +474,17 @@ public class ModbusSlave
             {
                 log.LogWarning(
                     "Unknown register requested by {Remote}: " +
-                    "Unit={Unit} FC=0x{Function:X2} Register={Register}",
+                    "TID={TransactionId} Unit={Unit} " +
+                    "FC=0x{Function:X2} Register={Register}",
                     remote,
+                    transactionId,
                     unitId,
                     function,
                     registerAddress);
 
                 await SendExceptionResponse(
                     stream,
+                    remote,
                     transactionId,
                     unitId,
                     function,
@@ -478,24 +521,16 @@ public class ModbusSlave
 
         await SendResponse(
             stream,
+            remote,
             transactionId,
             unitId,
             responsePdu,
             cancel);
-
-        log.LogInformation(
-            "MODBUS TX {Remote}: TX={Transaction} Unit={Unit} " +
-            "FC=0x{Function:X2} Addr={Address} Count={Count} OK",
-            remote,
-            transactionId,
-            unitId,
-            function,
-            address,
-            count);
     }
 
     private async Task SendExceptionResponse(
         NetworkStream stream,
+        string remote,
         ushort transactionId,
         byte unitId,
         byte function,
@@ -511,27 +546,40 @@ public class ModbusSlave
 
         await SendResponse(
             stream,
+            remote,
             transactionId,
             unitId,
             responsePdu,
             cancel);
 
         log.LogWarning(
-            "MODBUS TX EXCEPTION: TX={Transaction} Unit={Unit} " +
+            "Modbus exception sent to {Remote}: " +
+            "TID={TransactionId} Unit={Unit} " +
             "FC=0x{Function:X2} Exception=0x{Exception:X2}",
+            remote,
             transactionId,
             unitId,
             function,
             exceptionCode);
     }
 
-    private static async Task SendResponse(
+    private async Task SendResponse(
         NetworkStream stream,
+        string remote,
         ushort transactionId,
         byte unitId,
         byte[] pdu,
         CancellationToken cancel)
     {
+        /*
+         * Complete Modbus TCP ADU:
+         *
+         * Transaction ID  2 bytes
+         * Protocol ID     2 bytes
+         * Length          2 bytes
+         * Unit ID         1 byte
+         * PDU             variable
+         */
         var response =
             new byte[7 + pdu.Length];
 
@@ -543,6 +591,10 @@ public class ModbusSlave
             response.AsSpan(2, 2),
             0);
 
+        /*
+         * MBAP Length =
+         * Unit ID (1) + PDU length.
+         */
         BinaryPrimitives.WriteUInt16BigEndian(
             response.AsSpan(4, 2),
             (ushort)(1 + pdu.Length));
@@ -552,6 +604,20 @@ public class ModbusSlave
 
         pdu.CopyTo(
             response.AsSpan(7));
+
+        /*
+         * Log exactly what is about to be put on the TCP
+         * connection.
+         */
+        log.LogInformation(
+            "MODBUS TX {Remote}: " +
+            "TID={TransactionId} Unit={Unit} " +
+            "FC=0x{Function:X2} ADU={Adu}",
+            remote,
+            transactionId,
+            unitId,
+            pdu[0],
+            Convert.ToHexString(response));
 
         await stream.WriteAsync(
             response,
